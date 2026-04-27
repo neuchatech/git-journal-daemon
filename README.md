@@ -18,6 +18,33 @@ npx git-journal-daemon
 * `--ignore <glob>`   comma‑separated patterns in addition to .gitignore.
 * `--api-port <port>` base port for the local event API.
 
+## Local API and Discovery
+
+The daemon starts a loopback HTTP API, beginning at `--api-port` and retrying
+nearby ports if needed.
+
+* `GET /health` returns readiness JSON with `ready`, `status`, `pid`, `host`,
+  `port`, `startedAt`, and queued event count.
+* `POST /log_event` accepts structured workflow events and queues them for the
+  next journal snapshot.
+
+After the API is listening, the daemon writes repo-local discovery metadata as
+JSON:
+
+```json
+{
+  "pid": 12345,
+  "port": 3000,
+  "host": "127.0.0.1",
+  "repoPath": "/path/to/repo",
+  "timestamp": "2026-04-27T12:00:00.000Z"
+}
+```
+
+The preferred location is `.git/gjd.pid_port` when `.git` is a directory. If no
+usable `.git` directory exists, the fallback is `.neuchatech/gjd.pid_port`.
+Clean shutdown attempts to remove this file.
+
 ## How It Works
 
 1. Watches the working tree with **chokidar**.

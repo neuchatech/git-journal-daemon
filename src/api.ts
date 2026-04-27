@@ -13,62 +13,123 @@ export type EventQueue = ApiEvent[];
 
 const DEFAULT_BASE_PORT = 8888;
 const MAX_PORT_RETRIES = 100;
+const DEFAULT_HOST = '127.0.0.1';
+
+export interface ApiServerHandle {
+  server: http.Server;
+  port: number;
+  host: string;
+  startedAt: string;
+  close: () => Promise<void>;
+}
 
 export async function startApiServer(
   eventQueue: EventQueue,
   basePort: number = DEFAULT_BASE_PORT
 ): Promise<number> {
-  return new Promise<number>((resolve, reject) => {
-    let currentPort = basePort;
-    const server = http.createServer((req, res) => {
-      if (req.method === 'POST' && req.url === '/log_event') {
-        let body = '';
-        req.on('data', chunk => {
-          body += chunk.toString();
-        });
-        req.on('end', () => {
-          try {
-            const event = JSON.parse(body) as ApiEvent;
-            if (!event.type || !event.timestamp) {
-              res.writeHead(400, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ error: 'Missing required fields: type and timestamp' }));
-              return;
-            }
-            eventQueue.push(event);
-            res.writeHead(202, { 'Content-Type': 'application/json' });
-            res.end();
-          } catch (e) {
-            res.writeHead(400, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'Invalid JSON payload' }));
+  const handle = await startApiServerWithHandle(eventQueue, basePort);
+  return handle.port;
+}
+
+export async function startApiServerWithHandle(
+  eventQueue: EventQueue,
+  basePort: number = DEFAULT_BASE_PORT,
+  host: string = DEFAULT_HOST
+): Promise<ApiServerHandle> {
+  return new Promise<ApiServerHandle>((resolve, reject) => {
+    const tryListen = (currentPort: number) => {
+      const startedAt = new Date().toISOString();
+      const server = createApiHttpServer(eventQueue, startedAt, host);
+
+      server.once('error', (e: NodeJS.ErrnoException) => {
+        if (e.code === 'EADDRINUSE') {
+          console.warn(`Port ${currentPort} in use, trying next...`);
+          const nextPort = currentPort + 1;
+          if (nextPort >= basePort + MAX_PORT_RETRIES) {
+            reject(new Error(`Could not find an available port after ${MAX_PORT_RETRIES} retries.`));
+          } else {
+            tryListen(nextPort);
           }
-        });
-      } else {
-        res.writeHead(404, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Not Found' }));
-      }
-    });
-
-    server.on('error', (e: NodeJS.ErrnoException) => {
-      if (e.code === 'EADDRINUSE') {
-        console.warn(`Port ${currentPort} in use, trying next...`);
-        server.close();
-        currentPort++;
-        if (currentPort >= basePort + MAX_PORT_RETRIES) {
-          reject(new Error(`Could not find an available port after ${MAX_PORT_RETRIES} retries.`));
         } else {
-          server.listen(currentPort, '127.0.0.1');
+          reject(e);
         }
-      } else {
-        reject(e);
-      }
-    });
+      });
 
-    server.on('listening', () => {
-      const address = server.address() as AddressInfo;
-      console.log(`JOURNAL_DAEMON_PORT:${address.port}`); // For client to capture
-      resolve(address.port);
-    });
+      server.once('listening', () => {
+        const address = server.address() as AddressInfo;
+        console.log(`JOURNAL_DAEMON_PORT:${address.port}`); // For client to capture
+        resolve({
+          server,
+          port: address.port,
+          host,
+          startedAt,
+          close: () =>
+            new Promise<void>((closeResolve, closeReject) => {
+              server.close(error => {
+                if (error) {
+                  closeReject(error);
+                  return;
+                }
+                closeResolve();
+              });
+            }),
+        });
+      });
 
-    server.listen(currentPort, '127.0.0.1');
+      server.listen(currentPort, host);
+    };
+
+    tryListen(basePort);
   });
+}
+
+function createApiHttpServer(eventQueue: EventQueue, startedAt: string, host: string): http.Server {
+  const server = http.createServer((req, res) => {
+    if (req.method === 'GET' && req.url === '/health') {
+      const address = server.address() as AddressInfo | null;
+      writeJson(res, 200, {
+        ready: true,
+        status: 'ready',
+        service: 'git-journal-daemon',
+        pid: process.pid,
+        host,
+        port: address?.port,
+        startedAt,
+        uptimeSeconds: Math.floor(process.uptime()),
+        queueDepth: eventQueue.length,
+      });
+      return;
+    }
+
+    if (req.method === 'POST' && req.url === '/log_event') {
+      let body = '';
+      req.on('data', chunk => {
+        body += chunk.toString();
+      });
+      req.on('end', () => {
+        try {
+          const event = JSON.parse(body) as ApiEvent;
+          if (!event.type || !event.timestamp) {
+            writeJson(res, 400, { error: 'Missing required fields: type and timestamp' });
+            return;
+          }
+          eventQueue.push(event);
+          res.writeHead(202, { 'Content-Type': 'application/json' });
+          res.end();
+        } catch (e) {
+          writeJson(res, 400, { error: 'Invalid JSON payload' });
+        }
+      });
+      return;
+    }
+
+    writeJson(res, 404, { error: 'Not Found' });
+  });
+
+  return server;
+}
+
+function writeJson(res: http.ServerResponse, statusCode: number, body: unknown): void {
+  res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(body));
 }
