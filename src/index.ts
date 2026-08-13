@@ -7,7 +7,8 @@ import { Command } from 'commander';
 import path from 'path';
 // @ts-ignore
 import process from 'process';
-import { startApiServer, type EventQueue } from './api.js';
+import { startApiServerWithHandle, type ApiServerHandle, type EventQueue } from './api.js';
+import { removePortFile, writePortFile } from './port-file.js';
 
 const program = new Command();
 program
@@ -28,10 +29,18 @@ const journaler = new Journaler({
 });
 
 const ignore = opts.ignore ? opts.ignore.split(',') : [];
+let apiServer: ApiServerHandle | undefined;
+let shuttingDown = false;
 
 async function main() {
   try {
-    await startApiServer(eventQueue, parseInt(opts.apiPort, 10));
+    apiServer = await startApiServerWithHandle(eventQueue, parseInt(opts.apiPort, 10));
+    await writePortFile({
+      pid: process.pid,
+      port: apiServer.port,
+      host: apiServer.host,
+      repoPath: repoDir,
+    });
     console.log('📢 API server started.');
   } catch (error) {
     console.error('💀 Failed to start API server:', error);
@@ -42,5 +51,34 @@ async function main() {
   console.log('👀 Watcher started.');
   console.log('🪄 git‑journal‑daemon running…');
 }
+
+async function shutdown(signal: NodeJS.Signals) {
+  if (shuttingDown) {
+    return;
+  }
+
+  shuttingDown = true;
+  journaler.stop();
+
+  try {
+    await removePortFile(repoDir);
+  } catch (error) {
+    console.warn('Failed to remove git-journal-daemon discovery file:', error);
+  }
+
+  try {
+    await apiServer?.close();
+  } catch (error) {
+    console.warn('Failed to close git-journal-daemon API server:', error);
+  }
+
+  process.exit(signal === 'SIGINT' ? 130 : 143);
+}
+
+process.once('SIGINT', () => void shutdown('SIGINT'));
+process.once('SIGTERM', () => void shutdown('SIGTERM'));
+process.once('beforeExit', () => {
+  void removePortFile(repoDir);
+});
 
 main();
